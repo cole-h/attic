@@ -13,6 +13,7 @@ use aws_sdk_s3::{
 };
 use bytes::BytesMut;
 use futures::future::join_all;
+use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
 
@@ -163,6 +164,35 @@ impl S3Backend {
     }
 }
 
+async fn send_presigned_request(
+    http_client: &reqwest::Client,
+    presigned_request: aws_sdk_s3::presigning::PresignedRequest,
+    body: bytes::Bytes,
+) -> reqwest::Result<reqwest::Response> {
+    http_client
+        .request(
+            presigned_request
+                .method()
+                .parse()
+                .expect("converted method"),
+            presigned_request.uri(),
+        )
+        .headers(
+            presigned_request
+                .headers()
+                .map(|(name, value)| {
+                    (
+                        HeaderName::try_from(name).expect("converted header name"),
+                        HeaderValue::from_str(value).expect("converted header value"),
+                    )
+                })
+                .collect(),
+        )
+        .body(body)
+        .send()
+        .await
+}
+
 #[async_trait]
 impl StorageBackend for S3Backend {
     async fn upload_file(
@@ -175,15 +205,23 @@ impl StorageBackend for S3Backend {
             .await
             .map_err(ServerError::storage_error)?;
 
+        // FIXME: Configurable expiration
+        let presign_config = PresigningConfig::expires_in(Duration::from_secs(600))
+            .map_err(ServerError::storage_error)?;
+        let http_client = reqwest::Client::new();
+
         if first_chunk.len() < CHUNK_SIZE {
             // do a normal PutObject
-            let put_object = self
+            let presigned_request = self
                 .client
                 .put_object()
                 .bucket(&self.config.bucket)
                 .key(&name)
-                .body(first_chunk.into())
-                .send()
+                .presigned(presign_config)
+                .await
+                .map_err(ServerError::storage_error)?;
+
+            let put_object = send_presigned_request(&http_client, presigned_request, first_chunk)
                 .await
                 .map_err(ServerError::storage_error)?;
 
@@ -205,7 +243,7 @@ impl StorageBackend for S3Backend {
             .await
             .map_err(ServerError::storage_error)?;
 
-        let upload_id = multipart.upload_id().unwrap();
+        let upload_id = multipart.upload_id().unwrap().to_string();
 
         let cleanup = Finally::new({
             let bucket = self.config.bucket.clone();
@@ -249,15 +287,42 @@ impl StorageBackend for S3Backend {
             }
 
             let client = self.client.clone();
-            let fut = tokio::task::spawn({
-                client
+            let http_client = http_client.clone();
+            let bucket = self.config.bucket.clone();
+            let name = name.clone();
+            let upload_id = upload_id.clone();
+            let part_number_clone = part_number.clone();
+            let presign_config = presign_config.clone();
+
+            let fut = tokio::task::spawn(async move {
+                let presigned_request = client
                     .upload_part()
-                    .bucket(&self.config.bucket)
-                    .key(&name)
+                    .bucket(bucket)
+                    .key(name)
                     .upload_id(upload_id)
-                    .part_number(part_number)
-                    .body(chunk.clone().into())
-                    .send()
+                    .part_number(part_number_clone)
+                    .presigned(presign_config)
+                    .await
+                    .map_err(ServerError::storage_error)?;
+
+                let upload_part = send_presigned_request(&http_client, presigned_request, chunk)
+                    .await
+                    .map_err(ServerError::storage_error)?;
+
+                struct UploadPart {
+                    part_number: i32,
+                    etag: Option<String>,
+                }
+
+                let upload_part = UploadPart {
+                    part_number,
+                    etag: upload_part
+                        .headers()
+                        .get(reqwest::header::ETAG)
+                        .and_then(|v| Some(v.to_str().ok()?.to_string())),
+                };
+
+                Ok::<_, ServerError>(upload_part)
             });
 
             parts.push(fut);
@@ -268,19 +333,12 @@ impl StorageBackend for S3Backend {
             .await
             .into_iter()
             .map(|join_result| join_result.unwrap())
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(ServerError::storage_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
-            .enumerate()
-            .map(|(idx, part)| {
-                let part_number = idx + 1;
+            .map(|part| {
                 CompletedPart::builder()
-                    .set_e_tag(part.e_tag().map(str::to_string))
-                    .set_part_number(Some(part_number as i32))
-                    .set_checksum_crc32(part.checksum_crc32().map(str::to_string))
-                    .set_checksum_crc32_c(part.checksum_crc32_c().map(str::to_string))
-                    .set_checksum_sha1(part.checksum_sha1().map(str::to_string))
-                    .set_checksum_sha256(part.checksum_sha256().map(str::to_string))
+                    .set_e_tag(part.etag)
+                    .set_part_number(Some(part.part_number))
                     .build()
             })
             .collect::<Vec<_>>();
